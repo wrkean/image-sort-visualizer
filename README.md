@@ -14,11 +14,12 @@ A graphical sorting algorithm visualizer for images. Takes any image, splits it 
 
 ## Build
 
+> [!CAUTION]
+> You need to have Rust + Cargo installed in your system to be able to build the repo
+
 ```bash
 cargo build --release
 ```
-
-Requires Rust (edition 2024).
 
 ## Usage
 
