@@ -10,6 +10,7 @@ A graphical sorting algorithm visualizer for images. Takes any image, splits it 
 - Deterministic seeded shuffles with on-disk caching for instant replay
 - Configurable grid size, animation speed, and duration
 - Interactive controls: pause, reshuffle, switch algorithms, adjust speed
+- **Procedural sorting sounds**: every comparison/swap/set emits a short sine tone pitched by cell value (mute with `M`, disable with `--no-sound`)
 
 ## Build
 
@@ -41,6 +42,7 @@ cargo run --release -- <IMAGE_PATH> [OPTIONS]
 | `--compare [ALGOS]` | Side-by-side comparison mode | all algorithms |
 | `--cache-dir <DIR>` | Cache directory for seeded animations | `~/.cache/sort_visualizer` |
 | `--no-cache` | Disable caching | off |
+| `--no-sound` | Disable sorting sounds | off |
 
 ### Examples
 
@@ -68,6 +70,7 @@ cargo run --release -- photo.jpg --seed 42 --duration 15
 | Left / Right | Switch algorithm (single mode) |
 | Space | Pause / resume |
 | Up / Down | Increase / decrease animation speed |
+| M | Mute / unmute sorting sounds |
 | R | Reshuffle with a new random permutation |
 | Q / Esc | Quit |
 
@@ -81,6 +84,16 @@ cargo run --release -- photo.jpg --seed 42 --duration 15
 
 In **compare mode**, the same initial shuffle is shared across all panes, so you can watch different algorithms solve the identical puzzle side-by-side.
 
+## Sound
+
+Sorting sounds play by default when an audio device is available (disable at startup with `--no-sound`, or mute anytime with `M`). Each event produces short decaying sine tones:
+
+- **Comparison** — two quiet notes for the cells being compared
+- **Swap** — two louder notes for the values being exchanged
+- **Set** (mergesort) — a single note for the value settling into its slot
+
+Pitch rises logarithmically with the cell's sort key (its original index or luminance), so the sequence of tones traces the algorithm's activity — `bubble` sounds rhythmic, `quick` frantic, `merge` smooth. In compare mode each pane plays its own tones simultaneously on the same output device. Note that at very high speeds (many events per frame) tones are dropped once the audio output falls behind, keeping the sound tied to the animation instead of lagging behind it.
+
 ## Project Structure
 
 ```
@@ -89,6 +102,7 @@ src/
   sort.rs    -- Sorting algorithms and macro-driven registry
   grid.rs    -- Image-to-grid decomposition and luminance
   cache.rs   -- On-disk binary cache for seeded animations
+  sound.rs   -- Procedural sorting sounds (sine tone synthesis)
 ```
 
 ## License

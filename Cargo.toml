@@ -8,3 +8,4 @@ clap = { version = "4", features = ["derive"] }
 image = "0.25.10"
 macroquad = "0.4.16"
 rand = "0.10.2"
+rodio = { version = "0.22", default-features = false, features = ["playback"] }

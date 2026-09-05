@@ -1,6 +1,7 @@
 mod cache;
 mod grid;
 mod sort;
+mod sound;
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -47,7 +48,7 @@ impl KeyMode {
                   collapse into a sorted arrangement. With --seed, the animation is \
                   deterministic and cached on disk, so re-running with the same seed + \
                   settings loads instantly.",
-    after_help = "CONTROLS:\n    Left/Right      switch sorting algorithm (single mode)\n    R               reshuffle (fresh random permutation)\n    Space           pause / resume\n    Up/Down         increase / decrease animation speed\n    Q / Esc         quit\n\nCOMPARE MODE:\n    --compare              compare all algorithms side-by-side\n    --compare quick,merge  compare specific algorithms"
+    after_help = "CONTROLS:\n    Left/Right      switch sorting algorithm (single mode)\n    R               reshuffle (fresh random permutation)\n    Space           pause / resume\n    Up/Down         increase / decrease animation speed\n    M               mute / unmute sorting sounds\n    Q / Esc         quit\n\nCOMPARE MODE:\n    --compare              compare all algorithms side-by-side\n    --compare quick,merge  compare specific algorithms\n\nSOUND:\n    Sorting sounds play by default when an audio device is available. Each\n    comparison/swap/set emits short sine tones pitched by cell value; muted\n    with M or disabled entirely with --no-sound."
 )]
 struct Options {
     /// Input image to visualize
@@ -100,6 +101,10 @@ struct Options {
     /// Compare algorithms side-by-side. Comma-separated list, or no value for all.
     #[arg(long, value_name = "ALGO1,ALGO2,...", num_args = 0.., default_missing_value = "")]
     compare: Option<Option<String>>,
+
+    /// Disable sorting sounds (off by default: sounds play when an audio device is available)
+    #[arg(long)]
+    no_sound: bool,
 }
 
 impl Options {
@@ -294,6 +299,7 @@ async fn main() {
         paused: bool,
         done: bool,
         seeded_base: bool,
+        sound: Option<sound::Sound>,
     }
 
     let mut animations: Vec<AnimationState> = Vec::new();
@@ -353,11 +359,37 @@ async fn main() {
             paused: false,
             done: false,
             seeded_base,
+            sound: None,
         });
     }
 
+    // Sound system: one outlet per pane, all sharing the device's output.
+    // If no audio device exists (or --no-sound was given) every pane stays
+    // silent; no error is raised.
+    let output = if opts.no_sound {
+        None
+    } else {
+        sound::Output::open()
+    };
+    for anim in animations.iter_mut() {
+        anim.sound = output.as_ref().map(|o| o.sound());
+    }
+
+    // Outer mute toggle — the per-pane `sound` generators hold the actual state.
     let mut paused = false;
     let mut highlight: Vec<Option<(usize, usize)>> = vec![None; animations.len()];
+
+    // Map a cell id to a normalized pitch value (0..1) describing the key it
+    // is sorted by. In index mode the sort key is the cell id itself; in
+    // luminance mode it is the cell's brightness. Used to pitch the tones.
+    let pitch_of = |id: usize| -> f32 {
+        match key {
+            KeyMode::Index => {
+                if n <= 1 { 0.0 } else { id as f32 / (n - 1) as f32 }
+            }
+            KeyMode::Luma => grid.luma[id].clamp(0.0, 1.0),
+        }
+    };
 
     loop {
         // ---------------------------------------------------------- input
@@ -368,6 +400,13 @@ async fn main() {
             paused = !paused;
             for anim in &mut animations {
                 anim.paused = paused;
+            }
+        }
+        if is_key_pressed(KeyCode::M) {
+            for anim in &mut animations {
+                if let Some(s) = &mut anim.sound {
+                    s.set_muted(!s.is_muted());
+                }
             }
         }
         if is_key_pressed(KeyCode::R) {
@@ -437,22 +476,38 @@ async fn main() {
         }
 
         // -------------------------------------------------------- advance
+        // Reusable per-pane collection of this frame's tones (pitch, volume).
+        // Kept outside the loop body and cleared each frame to avoid
+        // reallocating per frame.
+        let mut frame_tones: Vec<Vec<sound::Tone>> = vec![Vec::new(); animations.len()];
         let mut _all_done = true;
         for (i, anim) in animations.iter_mut().enumerate() {
             if !anim.paused {
                 let remaining = anim.events.len().saturating_sub(anim.cursor);
                 let steps = anim.speed.min(remaining);
                 let end = anim.cursor + steps;
+                let tones = &mut frame_tones[i];
                 for &e in &anim.events[anim.cursor..end] {
                     match e {
-                        Event::Cmp { a, b } => highlight[i] = Some((a, b)),
+                        Event::Cmp { a, b } => {
+                            highlight[i] = Some((a, b));
+                            // Quiet blip: the two values being compared.
+                            tones.push((pitch_of(anim.data[a]), 0.45));
+                            tones.push((pitch_of(anim.data[b]), 0.45));
+                        }
                         Event::Swap { a, b } => {
+                            // Two notes for the values leaving their slots
+                            // (captured before they move).
+                            tones.push((pitch_of(anim.data[a]), 0.85));
+                            tones.push((pitch_of(anim.data[b]), 0.85));
                             anim.data.swap(a, b);
                             highlight[i] = Some((a, b));
                         }
                         Event::Set { idx, value } => {
                             anim.data[idx] = value;
                             highlight[i] = Some((idx, idx));
+                            // Single note for the value settling into its slot.
+                            tones.push((pitch_of(value), 0.65));
                         }
                     }
                 }
@@ -462,6 +517,11 @@ async fn main() {
             if !anim.done {
                 _all_done = false;
             }
+            // Render this pane's frame as one mixed buffer.
+            if let Some(s) = &anim.sound {
+                s.frame(&frame_tones[i]);
+            }
+            frame_tones[i].clear();
         }
 
         // ---------------------------------------------------------- render
@@ -501,8 +561,13 @@ async fn main() {
         }
 
         // Shared header (grid + key info, drawn once so narrow panes don't overlap).
+        let sound_status = match &animations[0].sound {
+            None => "",
+            Some(s) if s.is_muted() => "   |   sound: MUTED  (M to unmute)",
+            Some(_) => "",
+        };
             draw_fitting_text(
-            &format!("grid {cols} x {rows}   |   key: {}", key.name()),
+            &format!("grid {cols} x {rows}   |   key: {}{sound_status}", key.name()),
             pad_h,
             18.0,
             avail_w,
@@ -567,7 +632,7 @@ async fn main() {
 
         // Global footer
         draw_text(
-            "[Left/Right] algorithm (single mode)   [R] reshuffle   [Space] pause   [Up/Down] speed   [Q/Esc] quit",
+            "[Left/Right] algorithm (single mode)   [R] reshuffle   [Space] pause   [Up/Down] speed   [M] mute   [Q/Esc] quit",
             20.0,
             sh - 18.0,
             17.0,
