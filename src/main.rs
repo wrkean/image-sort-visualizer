@@ -501,12 +501,12 @@ async fn main() {
         }
 
         // Shared header (grid + key info, drawn once so narrow panes don't overlap).
-        draw_fitting_text(
+            draw_fitting_text(
             &format!("grid {cols} x {rows}   |   key: {}", key.name()),
             pad_h,
             18.0,
             avail_w,
-            16,
+            26,
             GRAY,
         );
 
@@ -553,7 +553,7 @@ async fn main() {
             // Per-pane status text
             let status = if anim.done { "  SORTED" } else { "" };
             let algo_name = anim.algo.name();
-            draw_fitting_text(algo_name, ox, 38.0, pane_w, 20, WHITE);
+            draw_fitting_text(algo_name, ox, 38.0, pane_w, 28, WHITE);
             let status_line = format!(
                 "step {} / {}{}   {} ev/frame{}",
                 anim.cursor,
