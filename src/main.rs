@@ -32,6 +32,8 @@ OPTIONS:
     --speed N       events applied per frame (default: auto-sized so the
                     animation takes roughly ten seconds)
     --seed N        reproducible initial shuffle
+    --grid on|off   draw the grid lines between cells   (default on)
+                    off makes cells flush, so the boundaries are invisible
 
 CONTROLS:
     Left/Right      switch sorting algorithm
@@ -72,6 +74,7 @@ struct Options {
     key: KeyMode,
     speed: Option<usize>,
     seed: Option<u64>,
+    grid: bool,
 }
 
 impl Options {
@@ -91,6 +94,7 @@ impl Options {
             key: KeyMode::Index,
             speed: None,
             seed: None,
+            grid: true,
         };
 
         let mut i = 0;
@@ -127,6 +131,11 @@ impl Options {
                 }
                 "--seed" => {
                     o.seed = Some(need!("--seed").parse().map_err(|_| "invalid --seed value")?);
+                }
+                "--grid" => {
+                    let g = need!("--grid");
+                    o.grid =
+                        parse_bool(&g).ok_or_else(|| format!("invalid --grid value '{g}' (use on/off)"))?;
                 }
                 s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
                 _ => {
@@ -193,6 +202,15 @@ fn compute_events(algo: Algo, base: &[usize], grid: &Grid, key: KeyMode) -> Vec<
 /// Auto-pick a playback speed so the whole animation takes ~10 s at 60 fps.
 fn auto_speed(total_events: usize) -> usize {
     (total_events / 600).clamp(1, 1_000_000)
+}
+
+/// Parse a human-readable boolean (used for `--grid`).
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Some(true),
+        "off" | "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 #[macroquad::main(window_conf)]
@@ -310,7 +328,13 @@ async fn main() {
         let ox = (sw - grid_w) / 2.0;
         let oy = header_h + (avail_h - grid_h) / 2.0;
 
-        let gap = (cell_s * 0.04).clamp(1.0, 4.0);
+        // Gap between cells shows the background through it as "grid lines".
+        // With `--grid off` the cells are drawn flush, so the grid is invisible.
+        let gap = if opts.grid {
+            (cell_s * 0.04).clamp(1.0, 4.0)
+        } else {
+            0.0
+        };
         let cell_draw = (cell_s - gap).max(1.0);
 
         for r in 0..rows {
@@ -321,6 +345,8 @@ async fn main() {
                 let x = ox + c as f32 * cell_s + gap * 0.5;
                 let y = oy + r as f32 * cell_s + gap * 0.5;
 
+                // Half-texel inset keeps linear filtering from bleeding into the
+                // neighbouring cell, so flush cells form a seamless image.
                 draw_texture_ex(
                     &grid.texture,
                     x,
@@ -328,10 +354,10 @@ async fn main() {
                     WHITE,
                     DrawTextureParams {
                         source: Some(Rect::new(
-                            src_col as f32 * grid.cell_w,
-                            src_row as f32 * grid.cell_h,
-                            grid.cell_w,
-                            grid.cell_h,
+                            src_col as f32 * grid.cell_w + 0.5,
+                            src_row as f32 * grid.cell_h + 0.5,
+                            grid.cell_w - 1.0,
+                            grid.cell_h - 1.0,
                         )),
                         dest_size: Some(Vec2::new(cell_draw, cell_draw)),
                         ..Default::default()
