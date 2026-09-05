@@ -47,7 +47,7 @@ impl KeyMode {
                   collapse into a sorted arrangement. With --seed, the animation is \
                   deterministic and cached on disk, so re-running with the same seed + \
                   settings loads instantly.",
-    after_help = "CONTROLS:\n    Left/Right      switch sorting algorithm\n    R               reshuffle (fresh random permutation)\n    Space           pause / resume\n    Up/Down         increase / decrease animation speed\n    Q / Esc         quit"
+    after_help = "CONTROLS:\n    Left/Right      switch sorting algorithm (single mode)\n    R               reshuffle (fresh random permutation)\n    Space           pause / resume\n    Up/Down         increase / decrease animation speed\n    Q / Esc         quit\n\nCOMPARE MODE:\n    --compare              compare all algorithms side-by-side\n    --compare quick,merge  compare specific algorithms"
 )]
 struct Options {
     /// Input image to visualize
@@ -65,7 +65,7 @@ struct Options {
     #[arg(long, value_name = "N", conflicts_with_all = ["cols", "rows"])]
     cell: Option<usize>,
 
-    /// Sorting algorithm
+    /// Sorting algorithm (ignored in compare mode)
     #[arg(long, value_enum, default_value = "bubble")]
     algo: Algo,
 
@@ -92,6 +92,10 @@ struct Options {
     /// Disable reading/writing the on-disk cache (only relevant with --seed)
     #[arg(long)]
     no_cache: bool,
+
+    /// Compare algorithms side-by-side. Comma-separated list, or no value for all.
+    #[arg(long, value_name = "ALGO1,ALGO2,...", num_args = 0.., default_missing_value = "")]
+    compare: Option<Option<String>>,
 }
 
 impl Options {
@@ -202,19 +206,33 @@ async fn main() {
     let rows = grid.rows;
     let n = cols * rows;
 
-    let mut algo = opts.algo;
     let key = opts.key;
-
-    // ----- seed-based on-disk cache of the precomputed animation ----------
-    // Everything downstream of the seed is deterministic, so with `--seed` we
-    // can persist the shuffled base + recorded events and reload them on a
-    // later run instead of re-running the sort.
-    let cache_active = opts.seed.is_some() && !opts.no_cache;
-    let seed_val = opts.seed.unwrap_or(0);
     let key_idx = match key {
         KeyMode::Index => 0,
         KeyMode::Luma => 1,
     };
+
+    // Parse compare algorithms
+    let compare_algos: Vec<Algo> = match &opts.compare {
+        Some(inner) => {
+            let s = inner.as_deref().unwrap_or("");
+            if s.is_empty() {
+                Algo::ALL.to_vec()
+            } else {
+                s.split(',')
+                    .map(|a| Algo::from_str(a.trim(), true).unwrap())
+                    .collect()
+            }
+        }
+        None => vec![opts.algo],
+    };
+
+    // Check if we're in compare mode (more than 1 algorithm)
+    let compare_mode = compare_algos.len() > 1;
+
+    // ----- seed-based on-disk cache of the precomputed animation ----------
+    let cache_active = opts.seed.is_some() && !opts.no_cache;
+    let seed_val = opts.seed.unwrap_or(0);
     let image_hash = if cache_active {
         cache::fnv1a(img.to_rgba8().as_raw())
     } else {
@@ -222,11 +240,7 @@ async fn main() {
     };
     let cache_dir = opts.cache_dir.clone().unwrap_or_else(cache::default_dir);
 
-    // The current `base` is the seeded (cacheable) permutation only while the
-    // user hasn't hit `R`, which reshuffles with OS randomness. Used to avoid
-    // contaminating the cache after a reshuffle.
-    let mut seeded_base = cache_active;
-
+    // Build animation state for each algorithm
     let make_header = |algo: Algo| -> cache::CacheHeader {
         cache::CacheHeader {
             seed: seed_val,
@@ -239,35 +253,80 @@ async fn main() {
         }
     };
 
-    let (mut base, mut events) = if cache_active {
-        let header = make_header(algo);
-        let path = cache::cache_path(&cache_dir, &header);
-        match cache::load(&path, &header) {
-            Some(v) => {
-                eprintln!("[cache] hit   {}", path.display());
-                (v.base, v.events)
-            }
-            None => {
-                let b = shuffled(n, Some(seed_val));
-                let e = compute_events(algo, &b, &grid, key);
-                match cache::save(&path, &header, &b, &e) {
-                    Ok(()) => eprintln!("[cache] wrote {}", path.display()),
-                    Err(err) => eprintln!("[cache] warning: failed to write cache: {err}"),
-                }
-                (b, e)
-            }
-        }
+    struct AnimationState {
+        algo: Algo,
+        base: Vec<usize>,
+        events: Vec<Event>,
+        data: Vec<usize>,
+        cursor: usize,
+        speed: usize,
+        paused: bool,
+        done: bool,
+        seeded_base: bool,
+    }
+
+    let mut animations: Vec<AnimationState> = Vec::new();
+
+    // If in compare mode with seed, use the SAME seeded base for all algorithms
+    let shared_base = if cache_active && compare_mode {
+        let base = shuffled(n, Some(seed_val));
+        Some(base)
     } else {
-        let b = shuffled(n, opts.seed);
-        let e = compute_events(algo, &b, &grid, key);
-        (b, e)
+        None
     };
 
-    let mut data = base.clone(); // visible array, mutated by replayed events
-    let mut cursor = 0usize;
-    let mut highlight: Option<(usize, usize)> = None;
-    let mut speed = opts.speed.unwrap_or_else(|| auto_speed(events.len()));
+    for algo in compare_algos {
+        let (base, events, speed) = if cache_active {
+            let header = make_header(algo);
+            let path = cache::cache_path(&cache_dir, &header);
+            match cache::load(&path, &header) {
+                Some(v) => {
+                    eprintln!("[cache] hit   {}", path.display());
+                    let s = opts.speed.unwrap_or_else(|| auto_speed(v.events.len()));
+                    (v.base, v.events, s)
+                }
+                None => {
+                    let b = if let Some(ref sb) = shared_base {
+                        sb.clone()
+                    } else {
+                        shuffled(n, Some(seed_val))
+                    };
+                    let e = compute_events(algo, &b, &grid, key);
+                    let s = opts.speed.unwrap_or_else(|| auto_speed(e.len()));
+                    match cache::save(&path, &header, &b, &e) {
+                        Ok(()) => eprintln!("[cache] wrote {}", path.display()),
+                        Err(err) => eprintln!("[cache] warning: failed to write cache: {err}"),
+                    }
+                    (b, e, s)
+                }
+            }
+        } else {
+            let b = if let Some(ref sb) = shared_base {
+                sb.clone()
+            } else {
+                shuffled(n, opts.seed)
+            };
+            let e = compute_events(algo, &b, &grid, key);
+            let s = opts.speed.unwrap_or_else(|| auto_speed(e.len()));
+            (b, e, s)
+        };
+
+        let seeded_base = cache_active && (shared_base.is_some() || opts.seed.is_some());
+        animations.push(AnimationState {
+            algo,
+            base: base.clone(),
+            events,
+            data: base.clone(),
+            cursor: 0,
+            speed,
+            paused: false,
+            done: false,
+            seeded_base,
+        });
+    }
+
     let mut paused = false;
+    let mut highlight: Vec<Option<(usize, usize)>> = vec![None; animations.len()];
 
     loop {
         // ---------------------------------------------------------- input
@@ -276,100 +335,122 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::Space) {
             paused = !paused;
+            for anim in &mut animations {
+                anim.paused = paused;
+            }
         }
         if is_key_pressed(KeyCode::R) {
-            base = shuffled(n, None); // fresh random each time, seed only applies to startup
-            seeded_base = false; // no longer the seeded permutation: don't touch the cache
-            events = compute_events(algo, &base, &grid, key);
-            data = base.clone();
-            cursor = 0;
-            highlight = None;
-            if opts.speed.is_none() {
-                speed = auto_speed(events.len());
+            for (i, anim) in animations.iter_mut().enumerate() {
+                anim.base = if let Some(ref sb) = shared_base {
+                    sb.clone()
+                } else {
+                    shuffled(n, None)
+                };
+                anim.seeded_base = shared_base.is_some();
+                anim.events = compute_events(anim.algo, &anim.base, &grid, key);
+                anim.data = anim.base.clone();
+                anim.cursor = 0;
+                anim.done = false;
+                highlight[i] = None;
+                if opts.speed.is_none() {
+                    anim.speed = auto_speed(anim.events.len());
+                }
             }
         }
-        if is_key_pressed(KeyCode::Left) || is_key_pressed(KeyCode::Right) {
-            if is_key_pressed(KeyCode::Left) {
-                algo = algo.prev();
-            }
-            if is_key_pressed(KeyCode::Right) {
-                algo = algo.next();
-            }
-            if seeded_base {
-                // The current base is the seeded permutation, so the new
-                // algorithm's events can (and already may) come from the cache.
-                let header = make_header(algo);
-                let path = cache::cache_path(&cache_dir, &header);
-                match cache::load(&path, &header) {
-                    Some(v) => {
-                        base = v.base;
-                        events = v.events;
-                        eprintln!("[cache] hit   {}", path.display());
-                    }
-                    None => {
-                        events = compute_events(algo, &base, &grid, key);
-                        match cache::save(&path, &header, &base, &events) {
-                            Ok(()) => eprintln!("[cache] wrote {}", path.display()),
-                            Err(err) => eprintln!("[cache] warning: failed to write cache: {err}"),
-                        }
-                    }
+        if !compare_mode && (is_key_pressed(KeyCode::Left) || is_key_pressed(KeyCode::Right)) {
+            for (i, anim) in animations.iter_mut().enumerate() {
+                if is_key_pressed(KeyCode::Left) {
+                    anim.algo = anim.algo.prev();
                 }
-            } else {
-                events = compute_events(algo, &base, &grid, key);
-            }
-            data = base.clone();
-            cursor = 0;
-            highlight = None;
-            if opts.speed.is_none() {
-                speed = auto_speed(events.len());
+                if is_key_pressed(KeyCode::Right) {
+                    anim.algo = anim.algo.next();
+                }
+                if anim.seeded_base {
+                    let header = make_header(anim.algo);
+                    let path = cache::cache_path(&cache_dir, &header);
+                    match cache::load(&path, &header) {
+                        Some(v) => {
+                            anim.base = v.base;
+                            anim.events = v.events;
+                            eprintln!("[cache] hit   {}", path.display());
+                        }
+                        None => {
+                            anim.events = compute_events(anim.algo, &anim.base, &grid, key);
+                            match cache::save(&path, &header, &anim.base, &anim.events) {
+                                Ok(()) => eprintln!("[cache] wrote {}", path.display()),
+                                Err(err) => eprintln!("[cache] warning: failed to write cache: {err}"),
+                            }
+                        }
+                }
+                } else {
+                    anim.events = compute_events(anim.algo, &anim.base, &grid, key);
+                }
+                anim.data = anim.base.clone();
+                anim.cursor = 0;
+                anim.done = false;
+                highlight[i] = None;
+                if opts.speed.is_none() {
+                    anim.speed = auto_speed(anim.events.len());
+                }
             }
         }
         if is_key_pressed(KeyCode::Up) {
-            speed = speed.saturating_mul(2).max(1);
+            for anim in &mut animations {
+                anim.speed = anim.speed.saturating_mul(2).max(1);
+            }
         }
         if is_key_pressed(KeyCode::Down) {
-            speed = speed.saturating_div(2).max(1);
+            for anim in &mut animations {
+                anim.speed = anim.speed.saturating_div(2).max(1);
+            }
         }
 
         // -------------------------------------------------------- advance
-        if !paused {
-            let remaining = events.len() - cursor;
-            let steps = speed.min(remaining);
-            for _ in 0..steps {
-                match events[cursor] {
-                    Event::Cmp { a, b } => highlight = Some((a, b)),
-                    Event::Swap { a, b } => {
-                        data.swap(a, b);
-                        highlight = Some((a, b));
-                    }
-                    Event::Set { idx, value } => {
-                        data[idx] = value;
-                        highlight = Some((idx, idx));
+        let mut _all_done = true;
+        for (i, anim) in animations.iter_mut().enumerate() {
+            if !anim.paused {
+                let remaining = anim.events.len().saturating_sub(anim.cursor);
+                let steps = anim.speed.min(remaining);
+                for _ in 0..steps {
+                    if anim.cursor < anim.events.len() {
+                        match anim.events[anim.cursor] {
+                            Event::Cmp { a, b } => highlight[i] = Some((a, b)),
+                            Event::Swap { a, b } => {
+                                anim.data.swap(a, b);
+                                highlight[i] = Some((a, b));
+                            }
+                            Event::Set { idx, value } => {
+                                anim.data[idx] = value;
+                                highlight[i] = Some((idx, idx));
+                            }
+                        }
+                        anim.cursor += 1;
                     }
                 }
-                cursor += 1;
+            }
+            anim.done = anim.cursor >= anim.events.len();
+            if !anim.done {
+                _all_done = false;
             }
         }
-        let done = cursor >= events.len();
 
         // ---------------------------------------------------------- render
         clear_background(Color::from_rgba(16, 18, 24, 255));
 
         let sw = screen_width();
         let sh = screen_height();
-        let pad_h = 30.0f32; // left/right screen padding
-        let header_h = 95.0f32; // reserved for the status text
+        let pad_h = 30.0f32;
+        let header_h = 95.0f32;
         let footer_h = 40.0f32;
+        let num_panes = animations.len();
         let avail_w = sw - 2.0 * pad_h;
         let avail_h = sh - header_h - footer_h;
-        let cell_s = (avail_w / cols as f32).min(avail_h / rows as f32).max(1.0);
+
+        // Calculate layout for panes (horizontal split)
+        let pane_w = avail_w / num_panes as f32;
+        let cell_s = (pane_w / cols as f32).min(avail_h / rows as f32).max(1.0);
         let grid_w = cell_s * cols as f32;
         let grid_h = cell_s * rows as f32;
-        let ox = (sw - grid_w) / 2.0;
-        let oy = header_h + (avail_h - grid_h) / 2.0;
-
-        // Gap between cells shows the background through it as "grid lines".
-        // With `--grid off` the cells are drawn flush, so the grid is invisible.
         let gap = if opts.grid {
             (cell_s * 0.04).clamp(1.0, 4.0)
         } else {
@@ -377,71 +458,80 @@ async fn main() {
         };
         let cell_draw = (cell_s - gap).max(1.0);
 
-        for r in 0..rows {
-            for c in 0..cols {
-                let idx = r * cols + c;
-                let tile = data[idx]; // which cell sits at grid position (r, c)
-                let (src_col, src_row) = (tile % cols, tile / cols);
-                let x = ox + c as f32 * cell_s + gap * 0.5;
-                let y = oy + r as f32 * cell_s + gap * 0.5;
+        for (pane_idx, anim) in animations.iter().enumerate() {
+            let ox = pad_h + pane_idx as f32 * pane_w + (pane_w - grid_w) / 2.0;
+            let oy = header_h + (avail_h - grid_h) / 2.0;
 
-                // Half-texel inset keeps linear filtering from bleeding into the
-                // neighbouring cell, so flush cells form a seamless image.
-                draw_texture_ex(
-                    &grid.texture,
-                    x,
-                    y,
-                    WHITE,
-                    DrawTextureParams {
-                        source: Some(Rect::new(
-                            src_col as f32 * grid.cell_w + 0.5,
-                            src_row as f32 * grid.cell_h + 0.5,
-                            grid.cell_w - 1.0,
-                            grid.cell_h - 1.0,
-                        )),
-                        dest_size: Some(Vec2::new(cell_draw, cell_draw)),
-                        ..Default::default()
-                    },
-                );
+            for r in 0..rows {
+                for c in 0..cols {
+                    let idx = r * cols + c;
+                    let tile = anim.data[idx];
+                    let (src_col, src_row) = (tile % cols, tile / cols);
+                    let x = ox + c as f32 * cell_s + gap * 0.5;
+                    let y = oy + r as f32 * cell_s + gap * 0.5;
+
+                    draw_texture_ex(
+                        &grid.texture,
+                        x,
+                        y,
+                        WHITE,
+                        DrawTextureParams {
+                            source: Some(Rect::new(
+                                src_col as f32 * grid.cell_w + 0.5,
+                                src_row as f32 * grid.cell_h + 0.5,
+                                grid.cell_w - 1.0,
+                                grid.cell_h - 1.0,
+                            )),
+                            dest_size: Some(Vec2::new(cell_draw, cell_draw)),
+                            ..Default::default()
+                        },
+                    );
+                }
             }
+
+            // Highlight for this pane
+            if let Some((a, b)) = highlight[pane_idx] {
+                for idx in [a, b] {
+                    let (r, c) = (idx / cols, idx % cols);
+                    let x = ox + c as f32 * cell_s + gap * 0.5;
+                    let y = oy + r as f32 * cell_s + gap * 0.5;
+                    draw_rectangle(x, y, cell_draw, cell_draw, Color::from_rgba(255, 224, 60, 90));
+                }
+            }
+
+            // Per-pane status text
+            let status = if anim.done { "  SORTED" } else { "" };
+            let algo_name = anim.algo.name();
+            draw_text(
+                format!(
+                    "{}   |   grid {cols} x {rows}   |   key: {}",
+                    algo_name,
+                    key.name()
+                ),
+                ox,
+                38.0,
+                20.0,
+                WHITE,
+            );
+            draw_text(
+                format!(
+                    "step {} / {}{}   |   {} events/frame{}",
+                    anim.cursor,
+                    anim.events.len(),
+                    status,
+                    anim.speed,
+                    if anim.paused { "   [paused]" } else { "" }
+                ),
+                ox,
+                72.0,
+                16.0,
+                LIGHTGRAY,
+            );
         }
 
-        // Highlight the cells currently being compared / written.
-        if let Some((a, b)) = highlight {
-            for idx in [a, b] {
-                let (r, c) = (idx / cols, idx % cols);
-                let x = ox + c as f32 * cell_s + gap * 0.5;
-                let y = oy + r as f32 * cell_s + gap * 0.5;
-                draw_rectangle(x, y, cell_draw, cell_draw, Color::from_rgba(255, 224, 60, 90));
-            }
-        }
-
-        let status = if done { "  SORTED" } else { "" };
-        let grid_state = if opts.grid { "grid: on" } else { "grid: off" };
+        // Global footer
         draw_text(
-            format!(
-                "{}   |   grid {cols} x {rows}   |   key: {}   |   {grid_state}",
-                algo.name(),
-                key.name()
-            ),
-            20.0,
-            38.0,
-            27.0,
-            WHITE,
-        );
-        draw_text(
-            format!(
-                "step {cursor} / {}{status}   |   {speed} events/frame{}",
-                events.len(),
-                if paused { "   [paused]" } else { "" }
-            ),
-            20.0,
-            72.0,
-            19.0,
-            LIGHTGRAY,
-        );
-        draw_text(
-            "[Left/Right] algorithm   [R] reshuffle   [Space] pause   [Up/Down] speed   [Q/Esc] quit",
+            "[Left/Right] algorithm (single mode)   [R] reshuffle   [Space] pause   [Up/Down] speed   [Q/Esc] quit",
             20.0,
             sh - 18.0,
             17.0,
