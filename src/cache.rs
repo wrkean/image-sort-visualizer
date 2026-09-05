@@ -43,6 +43,7 @@ pub struct CacheHeader {
     pub image_hash: u64,
     pub cols: u32,
     pub rows: u32,
+    /// Algorithm id (Algo::code()), stable across runs.
     pub algo: u8,
     pub key: u8,
     pub n: u32,
@@ -67,20 +68,6 @@ pub fn default_dir() -> PathBuf {
     }
 }
 
-/// Stable numeric code for an algorithm (used in file names and headers).
-pub fn algo_code(algo: Algo) -> u8 {
-    match algo {
-        Algo::Bubble => 0,
-        Algo::Insertion => 1,
-        Algo::Selection => 2,
-        Algo::Quick => 3,
-        Algo::Heap => 4,
-        Algo::Merge => 5,
-    }
-}
-
-/// Simple deterministic 64-bit FNV-1a. Used to fingerprint the image content
-/// so cached data for a different image never collides.
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
@@ -90,19 +77,13 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-fn algo_name(code: u8) -> &'static str {
-    match code {
-        0 => "bubble",
-        1 => "insertion",
-        2 => "selection",
-        3 => "quick",
-        4 => "heap",
-        _ => "merge",
-    }
-}
-
 fn key_name(code: u8) -> &'static str {
     if code == 0 { "index" } else { "luma" }
+}
+
+/// Algorithm display name for cache filenames (bubble, insertion, ...).
+fn algo_name(code: u8) -> &'static str {
+    Algo::from_code(code).map(|a| a.code_str()).unwrap_or("unknown")
 }
 
 /// Full path of the cache file for a header.
@@ -249,7 +230,7 @@ mod tests {
             image_hash: 0xdead_beef_cafe_f00d,
             cols: 4,
             rows: 3,
-            algo: algo_code(Algo::Bubble),
+            algo: Algo::Bubble.code(),
             key: 0,
             n: 12,
         }

@@ -233,7 +233,7 @@ async fn main() {
             image_hash,
             cols: cols as u32,
             rows: rows as u32,
-            algo: cache::algo_code(algo),
+            algo: algo.code(),
             key: key_idx,
             n: n as u32,
         }
