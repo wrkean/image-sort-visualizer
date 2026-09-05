@@ -73,9 +73,13 @@ struct Options {
     #[arg(long, value_enum, default_value = "index")]
     key: KeyMode,
 
-    /// Events applied per frame (default: auto-sized to ~10 s animation)
+    /// Events applied per frame (default: auto-sized to the --duration target)
     #[arg(long, value_name = "N")]
     speed: Option<usize>,
+
+    /// Target animation length in seconds, used when --speed is not given (default: 10)
+    #[arg(long, value_name = "SECS", default_value_t = 10.0)]
+    duration: f32,
 
     /// Reproducible initial shuffle
     #[arg(long, value_name = "N")]
@@ -112,6 +116,9 @@ impl Options {
         }
         if self.speed == Some(0) {
             return Err("--speed must be >= 1".into());
+        }
+        if self.duration <= 0.0 {
+            return Err("--duration must be > 0".into());
         }
         if !self.image.exists() {
             return Err(format!("image file '{}' does not exist", self.image.display()));
@@ -154,9 +161,11 @@ fn compute_events(algo: Algo, base: &[usize], grid: &Grid, key: KeyMode) -> Vec<
     sort::collect_events(algo, &mut work, &cmp)
 }
 
-/// Auto-pick a playback speed so the whole animation takes ~10 s at 60 fps.
-fn auto_speed(total_events: usize) -> usize {
-    (total_events / 600).clamp(1, 1_000_000)
+/// Auto-pick a playback speed so the whole animation takes roughly
+/// `duration_s` seconds at 60 fps.
+fn auto_speed(total_events: usize, duration_s: f32) -> usize {
+    let frames = (60.0 * duration_s).max(1.0);
+    ((total_events as f32 / frames).ceil()).clamp(1.0, 1_000_000.0) as usize
 }
 
 /// Determine the requested grid dimensions.
@@ -304,7 +313,7 @@ async fn main() {
             match cache::load(&path, &header) {
                 Some(v) => {
                     eprintln!("[cache] hit   {}", path.display());
-                    let s = opts.speed.unwrap_or_else(|| auto_speed(v.events.len()));
+                    let s = opts.speed.unwrap_or_else(|| auto_speed(v.events.len(), opts.duration));
                     (v.base, v.events, s)
                 }
                 None => {
@@ -314,7 +323,7 @@ async fn main() {
                         shuffled(n, Some(seed_val))
                     };
                     let e = compute_events(algo, &b, &grid, key);
-                    let s = opts.speed.unwrap_or_else(|| auto_speed(e.len()));
+                    let s = opts.speed.unwrap_or_else(|| auto_speed(e.len(), opts.duration));
                     match cache::save(&path, &header, &b, &e) {
                         Ok(()) => eprintln!("[cache] wrote {}", path.display()),
                         Err(err) => eprintln!("[cache] warning: failed to write cache: {err}"),
@@ -329,7 +338,7 @@ async fn main() {
                 shuffled(n, opts.seed)
             };
             let e = compute_events(algo, &b, &grid, key);
-            let s = opts.speed.unwrap_or_else(|| auto_speed(e.len()));
+            let s = opts.speed.unwrap_or_else(|| auto_speed(e.len(), opts.duration));
             (b, e, s)
         };
 
@@ -375,7 +384,7 @@ async fn main() {
                 anim.done = false;
                 highlight[i] = None;
                 if opts.speed.is_none() {
-                    anim.speed = auto_speed(anim.events.len());
+                    anim.speed = auto_speed(anim.events.len(), opts.duration);
                 }
             }
         }
@@ -412,7 +421,7 @@ async fn main() {
                 anim.done = false;
                 highlight[i] = None;
                 if opts.speed.is_none() {
-                    anim.speed = auto_speed(anim.events.len());
+                    anim.speed = auto_speed(anim.events.len(), opts.duration);
                 }
             }
         }
@@ -433,22 +442,21 @@ async fn main() {
             if !anim.paused {
                 let remaining = anim.events.len().saturating_sub(anim.cursor);
                 let steps = anim.speed.min(remaining);
-                for _ in 0..steps {
-                    if anim.cursor < anim.events.len() {
-                        match anim.events[anim.cursor] {
-                            Event::Cmp { a, b } => highlight[i] = Some((a, b)),
-                            Event::Swap { a, b } => {
-                                anim.data.swap(a, b);
-                                highlight[i] = Some((a, b));
-                            }
-                            Event::Set { idx, value } => {
-                                anim.data[idx] = value;
-                                highlight[i] = Some((idx, idx));
-                            }
+                let end = anim.cursor + steps;
+                for &e in &anim.events[anim.cursor..end] {
+                    match e {
+                        Event::Cmp { a, b } => highlight[i] = Some((a, b)),
+                        Event::Swap { a, b } => {
+                            anim.data.swap(a, b);
+                            highlight[i] = Some((a, b));
                         }
-                        anim.cursor += 1;
+                        Event::Set { idx, value } => {
+                            anim.data[idx] = value;
+                            highlight[i] = Some((idx, idx));
+                        }
                     }
                 }
+                anim.cursor = end;
             }
             anim.done = anim.cursor >= anim.events.len();
             if !anim.done {
@@ -480,6 +488,18 @@ async fn main() {
         };
         let cell_draw = (cell_s - gap).max(1.0);
 
+        // Precompute each grid cell's in-pane offset. These are identical for
+        // every pane (only the pane origin `ox`/`oy` differs), so computing them
+        // once per frame spares rows*cols*num_panes multiplications/gap adds.
+        let mut offset_x = Vec::with_capacity(n);
+        let mut offset_y = Vec::with_capacity(n);
+        for r in 0..rows {
+            for c in 0..cols {
+                offset_x.push(c as f32 * cell_s + gap * 0.5);
+                offset_y.push(r as f32 * cell_s + gap * 0.5);
+            }
+        }
+
         // Shared header (grid + key info, drawn once so narrow panes don't overlap).
         draw_fitting_text(
             &format!("grid {cols} x {rows}   |   key: {}", key.name()),
@@ -499,8 +519,8 @@ async fn main() {
                     let idx = r * cols + c;
                     let tile = anim.data[idx];
                     let (src_col, src_row) = (tile % cols, tile / cols);
-                    let x = ox + c as f32 * cell_s + gap * 0.5;
-                    let y = oy + r as f32 * cell_s + gap * 0.5;
+                    let x = ox + offset_x[idx];
+                    let y = oy + offset_y[idx];
 
                     draw_texture_ex(
                         &grid.texture,
@@ -524,9 +544,8 @@ async fn main() {
             // Highlight for this pane
             if let Some((a, b)) = highlight[pane_idx] {
                 for idx in [a, b] {
-                    let (r, c) = (idx / cols, idx % cols);
-                    let x = ox + c as f32 * cell_s + gap * 0.5;
-                    let y = oy + r as f32 * cell_s + gap * 0.5;
+                    let x = ox + offset_x[idx];
+                    let y = oy + offset_y[idx];
                     draw_rectangle(x, y, cell_draw, cell_draw, Color::from_rgba(255, 224, 60, 90));
                 }
             }
@@ -535,7 +554,7 @@ async fn main() {
             let status = if anim.done { "  SORTED" } else { "" };
             let algo_name = anim.algo.name();
             draw_fitting_text(algo_name, ox, 38.0, pane_w, 20, WHITE);
-            let mut status_line = format!(
+            let status_line = format!(
                 "step {} / {}{}   {} ev/frame{}",
                 anim.cursor,
                 anim.events.len(),
