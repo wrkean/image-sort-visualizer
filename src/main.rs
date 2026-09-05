@@ -23,6 +23,10 @@ USAGE:
 OPTIONS:
     --cols N        number of cell columns (default 20)
     --rows N        number of cell rows    (default 20)
+    --cell N        alternative to --cols/--rows: each cell is N x N source
+                    pixels. The grid size is derived by dividing the image
+                    width and height by N (e.g. --cell 32 -> 32x32 px cells)
+                    cannot be combined with --cols/--rows
     --algo NAME     sorting algorithm      (default bubble)
                     one of: bubble, insertion, selection, quick, heap, merge
     --key WHAT      what the cells are sorted by   (default index)
@@ -68,8 +72,9 @@ impl KeyMode {
 
 struct Options {
     path: Option<String>,
-    cols: usize,
-    rows: usize,
+    cols: Option<usize>,
+    rows: Option<usize>,
+    cell: Option<usize>,
     algo: Algo,
     key: KeyMode,
     speed: Option<usize>,
@@ -88,8 +93,9 @@ impl Options {
 
         let mut o = Options {
             path: None,
-            cols: 20,
-            rows: 20,
+            cols: None,
+            rows: None,
+            cell: None,
             algo: Algo::Bubble,
             key: KeyMode::Index,
             speed: None,
@@ -111,10 +117,13 @@ impl Options {
             let arg = args[i].as_str();
             match arg {
                 "--cols" => {
-                    o.cols = need!("--cols").parse().map_err(|_| "invalid --cols value")?;
+                    o.cols = Some(need!("--cols").parse().map_err(|_| "invalid --cols value")?);
                 }
                 "--rows" => {
-                    o.rows = need!("--rows").parse().map_err(|_| "invalid --rows value")?;
+                    o.rows = Some(need!("--rows").parse().map_err(|_| "invalid --rows value")?);
+                }
+                "--cell" => {
+                    o.cell = Some(need!("--cell").parse().map_err(|_| "invalid --cell value")?);
                 }
                 "--algo" => {
                     let a = need!("--algo");
@@ -148,11 +157,17 @@ impl Options {
             i += 1;
         }
 
-        if o.cols == 0 {
+        if o.cols == Some(0) {
             return Err("--cols must be >= 1".into());
         }
-        if o.rows == 0 {
+        if o.rows == Some(0) {
             return Err("--rows must be >= 1".into());
+        }
+        if o.cell == Some(0) {
+            return Err("--cell must be >= 1".into());
+        }
+        if o.cell.is_some() && (o.cols.is_some() || o.rows.is_some()) {
+            return Err("--cell cannot be combined with --cols/--rows".into());
         }
         if o.speed == Some(0) {
             return Err("--speed must be >= 1".into());
@@ -213,6 +228,24 @@ fn parse_bool(s: &str) -> Option<bool> {
     }
 }
 
+/// Determine the requested grid dimensions.
+///
+/// When `--cell` is given, each cell spans `cell` source pixels, so the grid
+/// is `img_w / cell` by `img_h / cell`. Otherwise `--cols`/`--rows` are used
+/// directly, falling back to the default 20 when unspecified.
+fn resolve_grid(
+    cell: Option<usize>,
+    cols: Option<usize>,
+    rows: Option<usize>,
+    img_w: usize,
+    img_h: usize,
+) -> (usize, usize) {
+    match cell {
+        Some(c) => ((img_w / c).max(1), (img_h / c).max(1)),
+        None => (cols.unwrap_or(20), rows.unwrap_or(20)),
+    }
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let opts = match Options::parse() {
@@ -235,7 +268,11 @@ async fn main() {
     // Make sure the GL context is fully initialised before uploading textures.
     next_frame().await;
 
-    let grid = Grid::new(&img, opts.cols, opts.rows);
+    // Resolve grid dimensions: --cell derives them from the image size.
+    let (grid_cols, grid_rows) =
+        resolve_grid(opts.cell, opts.cols, opts.rows, img.width() as usize, img.height() as usize);
+
+    let grid = Grid::new(&img, grid_cols, grid_rows);
     let cols = grid.cols;
     let rows = grid.rows;
     let n = cols * rows;
@@ -408,5 +445,35 @@ async fn main() {
         );
 
         next_frame().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_grid;
+
+    const IMG_W: usize = 1920;
+    const IMG_H: usize = 1080;
+
+    #[test]
+    fn cell_size_derives_grid_from_image_dims() {
+        assert_eq!(resolve_grid(Some(128), None, None, IMG_W, IMG_H), (15, 8));
+        assert_eq!(resolve_grid(Some(40), None, None, IMG_W, IMG_H), (48, 27));
+        assert_eq!(resolve_grid(Some(64), None, None, IMG_W, IMG_H), (30, 16));
+    }
+
+    #[test]
+    fn cell_size_clamps_to_at_least_one() {
+        // Cell larger than the image: fall back to a 1 x 1 grid.
+        assert_eq!(resolve_grid(Some(5000), None, None, IMG_W, IMG_H), (1, 1));
+    }
+
+    #[test]
+    fn cols_rows_defaults() {
+        // Unspecified dimensions fall back to 20.
+        assert_eq!(resolve_grid(None, None, None, IMG_W, IMG_H), (20, 20));
+        assert_eq!(resolve_grid(None, Some(10), None, IMG_W, IMG_H), (10, 20));
+        assert_eq!(resolve_grid(None, None, Some(8), IMG_W, IMG_H), (20, 8));
+        assert_eq!(resolve_grid(None, Some(10), Some(8), IMG_W, IMG_H), (10, 8));
     }
 }
