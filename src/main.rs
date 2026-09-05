@@ -177,6 +177,28 @@ fn resolve_grid(
     }
 }
 
+/// Draws `text` at `x`,`y`, scaling it down (if needed) so it fits within `max_w` pixels.
+/// Uses the default font; text is clipped to the pane width instead of overflowing into neighbors.
+fn draw_fitting_text(text: &str, x: f32, y: f32, max_w: f32, font_size: u16, color: Color) {
+    let dims = measure_text(text, None, font_size, 1.0);
+    let scale = if dims.width > max_w && max_w > 0.0 {
+        (max_w / dims.width).clamp(0.35, 1.0)
+    } else {
+        1.0
+    };
+    draw_text_ex(
+        text,
+        x,
+        y,
+        TextParams {
+            font_size,
+            font_scale: scale,
+            color,
+            ..Default::default()
+        },
+    );
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
     let opts = Options::parse();
@@ -458,6 +480,16 @@ async fn main() {
         };
         let cell_draw = (cell_s - gap).max(1.0);
 
+        // Shared header (grid + key info, drawn once so narrow panes don't overlap).
+        draw_fitting_text(
+            &format!("grid {cols} x {rows}   |   key: {}", key.name()),
+            pad_h,
+            18.0,
+            avail_w,
+            16,
+            GRAY,
+        );
+
         for (pane_idx, anim) in animations.iter().enumerate() {
             let ox = pad_h + pane_idx as f32 * pane_w + (pane_w - grid_w) / 2.0;
             let oy = header_h + (avail_h - grid_h) / 2.0;
@@ -502,31 +534,16 @@ async fn main() {
             // Per-pane status text
             let status = if anim.done { "  SORTED" } else { "" };
             let algo_name = anim.algo.name();
-            draw_text(
-                format!(
-                    "{}   |   grid {cols} x {rows}   |   key: {}",
-                    algo_name,
-                    key.name()
-                ),
-                ox,
-                38.0,
-                20.0,
-                WHITE,
+            draw_fitting_text(algo_name, ox, 38.0, pane_w, 20, WHITE);
+            let mut status_line = format!(
+                "step {} / {}{}   {} ev/frame{}",
+                anim.cursor,
+                anim.events.len(),
+                status,
+                anim.speed,
+                if anim.paused { "  [paused]" } else { "" }
             );
-            draw_text(
-                format!(
-                    "step {} / {}{}   |   {} events/frame{}",
-                    anim.cursor,
-                    anim.events.len(),
-                    status,
-                    anim.speed,
-                    if anim.paused { "   [paused]" } else { "" }
-                ),
-                ox,
-                72.0,
-                16.0,
-                LIGHTGRAY,
-            );
+            draw_fitting_text(&status_line, ox, 72.0, pane_w, 16, LIGHTGRAY);
         }
 
         // Global footer
