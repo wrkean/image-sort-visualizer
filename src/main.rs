@@ -1,8 +1,10 @@
+mod cache;
 mod grid;
 mod sort;
 
 use std::cmp::Ordering;
 use std::env;
+use std::path::PathBuf;
 
 use grid::Grid;
 use macroquad::prelude::*;
@@ -38,6 +40,10 @@ OPTIONS:
     --seed N        reproducible initial shuffle
     --grid on|off   draw the grid lines between cells   (default on)
                     off makes cells flush, so the boundaries are invisible
+    --cache-dir DIR where seed-based visualizations are cached (default:
+                    $XDG_CACHE_HOME or ~/.cache/sort_visualizer)
+    --no-cache      disable reading/writing the on-disk cache (only relevant
+                    with --seed; without a seed nothing is cached anyway)
 
 CONTROLS:
     Left/Right      switch sorting algorithm
@@ -80,6 +86,8 @@ struct Options {
     speed: Option<usize>,
     seed: Option<u64>,
     grid: bool,
+    cache_dir: Option<PathBuf>,
+    no_cache: bool,
 }
 
 impl Options {
@@ -101,6 +109,8 @@ impl Options {
             speed: None,
             seed: None,
             grid: true,
+            cache_dir: None,
+            no_cache: false,
         };
 
         let mut i = 0;
@@ -145,6 +155,12 @@ impl Options {
                     let g = need!("--grid");
                     o.grid =
                         parse_bool(&g).ok_or_else(|| format!("invalid --grid value '{g}' (use on/off)"))?;
+                }
+                "--cache-dir" => {
+                    o.cache_dir = Some(PathBuf::from(need!("--cache-dir")));
+                }
+                "--no-cache" => {
+                    o.no_cache = true;
                 }
                 s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
                 _ => {
@@ -277,11 +293,67 @@ async fn main() {
     let rows = grid.rows;
     let n = cols * rows;
 
-    let mut base = shuffled(n, opts.seed); // initial parallel-permuted layout
     let mut algo = opts.algo;
     let key = opts.key;
 
-    let mut events = compute_events(algo, &base, &grid, key);
+    // ----- seed-based on-disk cache of the precomputed animation ----------
+    // Everything downstream of the seed is deterministic, so with `--seed` we
+    // can persist the shuffled base + recorded events and reload them on a
+    // later run instead of re-running the sort.
+    let cache_active = opts.seed.is_some() && !opts.no_cache;
+    let seed_val = opts.seed.unwrap_or(0);
+    let key_idx = match key {
+        KeyMode::Index => 0,
+        KeyMode::Luma => 1,
+    };
+    let image_hash = if cache_active {
+        cache::fnv1a(img.to_rgba8().as_raw())
+    } else {
+        0
+    };
+    let cache_dir = opts.cache_dir.clone().unwrap_or_else(cache::default_dir);
+
+    // The current `base` is the seeded (cacheable) permutation only while the
+    // user hasn't hit `R`, which reshuffles with OS randomness. Used to avoid
+    // contaminating the cache after a reshuffle.
+    let mut seeded_base = cache_active;
+
+    let make_header = |algo: Algo| -> cache::CacheHeader {
+        cache::CacheHeader {
+            seed: seed_val,
+            image_hash,
+            cols: cols as u32,
+            rows: rows as u32,
+            algo: cache::algo_code(algo),
+            key: key_idx,
+            n: n as u32,
+        }
+    };
+
+    let (mut base, mut events) = if cache_active {
+        let header = make_header(algo);
+        let path = cache::cache_path(&cache_dir, &header);
+        match cache::load(&path, &header) {
+            Some(v) => {
+                eprintln!("[cache] hit   {}", path.display());
+                (v.base, v.events)
+            }
+            None => {
+                let b = shuffled(n, Some(seed_val));
+                let e = compute_events(algo, &b, &grid, key);
+                match cache::save(&path, &header, &b, &e) {
+                    Ok(()) => eprintln!("[cache] wrote {}", path.display()),
+                    Err(err) => eprintln!("[cache] warning: failed to write cache: {err}"),
+                }
+                (b, e)
+            }
+        }
+    } else {
+        let b = shuffled(n, opts.seed);
+        let e = compute_events(algo, &b, &grid, key);
+        (b, e)
+    };
+
     let mut data = base.clone(); // visible array, mutated by replayed events
     let mut cursor = 0usize;
     let mut highlight: Option<(usize, usize)> = None;
@@ -298,6 +370,7 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::R) {
             base = shuffled(n, None); // fresh random each time, seed only applies to startup
+            seeded_base = false; // no longer the seeded permutation: don't touch the cache
             events = compute_events(algo, &base, &grid, key);
             data = base.clone();
             cursor = 0;
@@ -313,7 +386,28 @@ async fn main() {
             if is_key_pressed(KeyCode::Right) {
                 algo = algo.next();
             }
-            events = compute_events(algo, &base, &grid, key);
+            if seeded_base {
+                // The current base is the seeded permutation, so the new
+                // algorithm's events can (and already may) come from the cache.
+                let header = make_header(algo);
+                let path = cache::cache_path(&cache_dir, &header);
+                match cache::load(&path, &header) {
+                    Some(v) => {
+                        base = v.base;
+                        events = v.events;
+                        eprintln!("[cache] hit   {}", path.display());
+                    }
+                    None => {
+                        events = compute_events(algo, &base, &grid, key);
+                        match cache::save(&path, &header, &base, &events) {
+                            Ok(()) => eprintln!("[cache] wrote {}", path.display()),
+                            Err(err) => eprintln!("[cache] warning: failed to write cache: {err}"),
+                        }
+                    }
+                }
+            } else {
+                events = compute_events(algo, &base, &grid, key);
+            }
             data = base.clone();
             cursor = 0;
             highlight = None;
