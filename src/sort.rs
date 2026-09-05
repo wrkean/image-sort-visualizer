@@ -6,6 +6,8 @@
 
 use std::cmp::Ordering;
 
+use clap::ValueEnum;
+
 /// A single atomic operation performed by a sorting algorithm.
 ///
 /// `a`/`b`/`idx` are positions in the linear cell array
@@ -21,13 +23,19 @@ pub enum Event {
 }
 
 /// The sorting algorithm to visualise.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum Algo {
+    #[value(alias = "bubblesort")]
     Bubble,
+    #[value(alias = "insertionsort")]
     Insertion,
+    #[value(alias = "selectionsort")]
     Selection,
+    #[value(alias = "quicksort")]
     Quick,
+    #[value(alias = "heapsort")]
     Heap,
+    #[value(alias = "mergesort")]
     Merge,
 }
 
@@ -49,18 +57,6 @@ impl Algo {
             Algo::Quick => "Quicksort",
             Algo::Heap => "Heapsort",
             Algo::Merge => "Mergesort",
-        }
-    }
-
-    pub fn from_name(s: &str) -> Option<Algo> {
-        match s.trim().to_lowercase().replace([' ', '_', '-'], "").as_str() {
-            "bubble" | "bubblesort" => Some(Algo::Bubble),
-            "insertion" | "insertionsort" => Some(Algo::Insertion),
-            "selection" | "selectionsort" => Some(Algo::Selection),
-            "quick" | "quicksort" => Some(Algo::Quick),
-            "heap" | "heapsort" => Some(Algo::Heap),
-            "merge" | "mergesort" => Some(Algo::Merge),
-            _ => None,
         }
     }
 

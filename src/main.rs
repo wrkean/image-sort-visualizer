@@ -3,71 +3,24 @@ mod grid;
 mod sort;
 
 use std::cmp::Ordering;
-use std::env;
 use std::path::PathBuf;
 
+use clap::{Parser, ValueEnum};
 use grid::Grid;
 use macroquad::prelude::*;
 use ::rand::seq::SliceRandom;
 use ::rand::SeedableRng;
 use sort::{Algo, Event};
 
-const USAGE: &str = "\
-Sorting visualizer for images.
-
-Given an image, the image is split into a grid of cells, the cells are
-shuffled randomly, and then a sorting algorithm rearranges them back —
-you watch the shuffle collapse into a sorted arrangement.
-
-USAGE:
-    sort <image> [options]
-
-OPTIONS:
-    --cols N        number of cell columns (default 20)
-    --rows N        number of cell rows    (default 20)
-    --cell N        alternative to --cols/--rows: each cell is N x N source
-                    pixels. The grid size is derived by dividing the image
-                    width and height by N (e.g. --cell 32 -> 32x32 px cells)
-                    cannot be combined with --cols/--rows
-    --algo NAME     sorting algorithm      (default bubble)
-                    one of: bubble, insertion, selection, quick, heap, merge
-    --key WHAT      what the cells are sorted by   (default index)
-                    index  -> cell's original grid position
-                             (sorting reconstructs the original image)
-                    luma   -> cell's average brightness
-    --speed N       events applied per frame (default: auto-sized so the
-                    animation takes roughly ten seconds)
-    --seed N        reproducible initial shuffle
-    --grid on|off   draw the grid lines between cells   (default on)
-                    off makes cells flush, so the boundaries are invisible
-    --cache-dir DIR where seed-based visualizations are cached (default:
-                    $XDG_CACHE_HOME or ~/.cache/sort_visualizer)
-    --no-cache      disable reading/writing the on-disk cache (only relevant
-                    with --seed; without a seed nothing is cached anyway)
-
-CONTROLS:
-    Left/Right      switch sorting algorithm
-    R               reshuffle (fresh random permutation)
-    Space           pause / resume
-    Up/Down         increase / decrease animation speed
-    Q / Esc         quit
-";
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 enum KeyMode {
+    #[value(alias = "idx", alias = "position", alias = "original")]
     Index,
+    #[value(alias = "luminance", alias = "brightness", alias = "intensity")]
     Luma,
 }
 
 impl KeyMode {
-    fn from_name(s: &str) -> Option<KeyMode> {
-        match s.trim().to_lowercase().as_str() {
-            "index" | "idx" | "position" | "original" => Some(KeyMode::Index),
-            "luma" | "luminance" | "brightness" | "intensity" => Some(KeyMode::Luma),
-            _ => None,
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             KeyMode::Index => "original position",
@@ -76,123 +29,90 @@ impl KeyMode {
     }
 }
 
+/// Sorting visualizer for images.
+///
+/// The image is split into a grid of cells, the cells are shuffled randomly,
+/// and then a sorting algorithm rearranges them back — you watch the shuffle
+/// collapse into a sorted arrangement.
+///
+/// With `--seed`, the whole animation is deterministic and cached on disk, so
+/// re-running with the same seed + settings loads instantly.
+#[derive(Parser)]
+#[command(
+    name = "sort",
+    version,
+    about = "Sorting visualizer for images",
+    long_about = "The image is split into a grid of cells, the cells are shuffled randomly, \
+                  and then a sorting algorithm rearranges them back — you watch the shuffle \
+                  collapse into a sorted arrangement. With --seed, the animation is \
+                  deterministic and cached on disk, so re-running with the same seed + \
+                  settings loads instantly.",
+    after_help = "CONTROLS:\n    Left/Right      switch sorting algorithm\n    R               reshuffle (fresh random permutation)\n    Space           pause / resume\n    Up/Down         increase / decrease animation speed\n    Q / Esc         quit"
+)]
 struct Options {
-    path: Option<String>,
+    /// Input image to visualize
+    image: PathBuf,
+
+    /// Number of cell columns (default 20)
+    #[arg(long, value_name = "N")]
     cols: Option<usize>,
+
+    /// Number of cell rows (default 20)
+    #[arg(long, value_name = "N")]
     rows: Option<usize>,
+
+    /// Cell edge length in source pixels; alternative to --cols/--rows
+    #[arg(long, value_name = "N", conflicts_with_all = ["cols", "rows"])]
     cell: Option<usize>,
+
+    /// Sorting algorithm
+    #[arg(long, value_enum, default_value = "bubble")]
     algo: Algo,
+
+    /// What the cells are sorted by
+    #[arg(long, value_enum, default_value = "index")]
     key: KeyMode,
+
+    /// Events applied per frame (default: auto-sized to ~10 s animation)
+    #[arg(long, value_name = "N")]
     speed: Option<usize>,
+
+    /// Reproducible initial shuffle
+    #[arg(long, value_name = "N")]
     seed: Option<u64>,
+
+    /// Draw grid lines between cells (default off: cells are flush, boundaries invisible)
+    #[arg(short = 'g', long)]
     grid: bool,
+
+    /// Where seed-based visualizations are cached (default: $XDG_CACHE_HOME or ~/.cache/sort_visualizer)
+    #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
+
+    /// Disable reading/writing the on-disk cache (only relevant with --seed)
+    #[arg(long)]
     no_cache: bool,
 }
 
 impl Options {
-    fn parse() -> Result<Options, String> {
-        let args: Vec<String> = env::args().skip(1).collect();
-
-        if args.iter().any(|a| a == "-h" || a == "--help") {
-            print!("{USAGE}");
-            std::process::exit(0);
-        }
-
-        let mut o = Options {
-            path: None,
-            cols: None,
-            rows: None,
-            cell: None,
-            algo: Algo::Bubble,
-            key: KeyMode::Index,
-            speed: None,
-            seed: None,
-            grid: true,
-            cache_dir: None,
-            no_cache: false,
-        };
-
-        let mut i = 0;
-        macro_rules! need {
-            ($opt:expr) => {{
-                i += 1;
-                args.get(i)
-                    .cloned()
-                    .ok_or_else(|| format!("missing value for {}", $opt))?
-            }};
-        }
-
-        while i < args.len() {
-            let arg = args[i].as_str();
-            match arg {
-                "--cols" => {
-                    o.cols = Some(need!("--cols").parse().map_err(|_| "invalid --cols value")?);
-                }
-                "--rows" => {
-                    o.rows = Some(need!("--rows").parse().map_err(|_| "invalid --rows value")?);
-                }
-                "--cell" => {
-                    o.cell = Some(need!("--cell").parse().map_err(|_| "invalid --cell value")?);
-                }
-                "--algo" => {
-                    let a = need!("--algo");
-                    o.algo = Algo::from_name(&a)
-                        .ok_or_else(|| format!("unknown algorithm '{a}'"))?;
-                }
-                "--key" => {
-                    let k = need!("--key");
-                    o.key =
-                        KeyMode::from_name(&k).ok_or_else(|| format!("unknown key mode '{k}'"))?;
-                }
-                "--speed" => {
-                    o.speed = Some(need!("--speed").parse().map_err(|_| "invalid --speed value")?);
-                }
-                "--seed" => {
-                    o.seed = Some(need!("--seed").parse().map_err(|_| "invalid --seed value")?);
-                }
-                "--grid" => {
-                    let g = need!("--grid");
-                    o.grid =
-                        parse_bool(&g).ok_or_else(|| format!("invalid --grid value '{g}' (use on/off)"))?;
-                }
-                "--cache-dir" => {
-                    o.cache_dir = Some(PathBuf::from(need!("--cache-dir")));
-                }
-                "--no-cache" => {
-                    o.no_cache = true;
-                }
-                s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
-                _ => {
-                    if o.path.is_some() {
-                        return Err(format!("multiple image paths given ('{}')", arg));
-                    }
-                    o.path = Some(arg.to_string());
-                }
-            }
-            i += 1;
-        }
-
-        if o.cols == Some(0) {
+    /// Extra checks that aren't natural to express as clap rules.
+    fn validate(&self) -> Result<(), String> {
+        if self.cols == Some(0) {
             return Err("--cols must be >= 1".into());
         }
-        if o.rows == Some(0) {
+        if self.rows == Some(0) {
             return Err("--rows must be >= 1".into());
         }
-        if o.cell == Some(0) {
+        if self.cell == Some(0) {
             return Err("--cell must be >= 1".into());
         }
-        if o.cell.is_some() && (o.cols.is_some() || o.rows.is_some()) {
-            return Err("--cell cannot be combined with --cols/--rows".into());
-        }
-        if o.speed == Some(0) {
+        if self.speed == Some(0) {
             return Err("--speed must be >= 1".into());
         }
-        let path = o.path.clone().ok_or_else(|| "missing image path".to_string())?;
-        if !std::path::Path::new(&path).exists() {
-            return Err(format!("image file '{path}' does not exist"));
+        if !self.image.exists() {
+            return Err(format!("image file '{}' does not exist", self.image.display()));
         }
-        Ok(o)
+        Ok(())
     }
 }
 
@@ -235,15 +155,6 @@ fn auto_speed(total_events: usize) -> usize {
     (total_events / 600).clamp(1, 1_000_000)
 }
 
-/// Parse a human-readable boolean (used for `--grid`).
-fn parse_bool(s: &str) -> Option<bool> {
-    match s.trim().to_lowercase().as_str() {
-        "on" | "true" | "yes" | "1" => Some(true),
-        "off" | "false" | "no" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 /// Determine the requested grid dimensions.
 ///
 /// When `--cell` is given, each cell spans `cell` source pixels, so the grid
@@ -264,19 +175,17 @@ fn resolve_grid(
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let opts = match Options::parse() {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("error: {e}\n\n{USAGE}");
-            return;
-        }
-    };
+    let opts = Options::parse();
+    if let Err(e) = opts.validate() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
 
-    let path = opts.path.as_ref().unwrap(); // guaranteed Some after a successful parse
+    let path = &opts.image;
     let img = match image::open(path) {
         Ok(img) => img,
         Err(e) => {
-            eprintln!("error: failed to load '{path}': {e}");
+            eprintln!("error: failed to load '{}': {e}", path.display());
             std::process::exit(1);
         }
     };
@@ -508,9 +417,10 @@ async fn main() {
         }
 
         let status = if done { "  SORTED" } else { "" };
+        let grid_state = if opts.grid { "grid: on" } else { "grid: off" };
         draw_text(
             format!(
-                "{}   |   grid {cols} x {rows}   |   key: {}",
+                "{}   |   grid {cols} x {rows}   |   key: {}   |   {grid_state}",
                 algo.name(),
                 key.name()
             ),
